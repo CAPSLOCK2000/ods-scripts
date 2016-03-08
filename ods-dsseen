@@ -36,6 +36,11 @@ nosql() {
 	egrep -v '^MySQL database' 
 }
 
+# echo string with datetime prepended
+echo_time() {
+  echo `date --iso-8601=seconds` $1
+}
+
 
 # get OpenDNSSEC version
 ods_version() {
@@ -77,7 +82,7 @@ fi
 case $(ods_version) in
 	1.3*) keytagcol=9 ;;
 	1.4*) keytagcol=12 ;;
-	*) echo "Unknown OpenDNSSEC version, bailing out!"; exit 1 ;;
+	*) echo_time "Unknown OpenDNSSEC version, bailing out!"; exit 1 ;;
 esac
 
 dns=$(mktemp)
@@ -87,7 +92,7 @@ for zone in $zones; do
 	# dig: 39269 8 2 9EC50E7BBCC4095355A776D6183773197C05F320FDDE87E513022DB9 6A1E2F48
 	$DIG +adflag +aaonly  +short -t DS $zone $server | cut -d ' ' -f 1| sort > $dns
 	if [ ! -s "$dns" ]; then # $dns should never be empty
-		echo "warning: no key(s) for $zone found in DNS at all"
+		echo_time "warning: no key(s) for $zone found in DNS at all"
 	fi
 
 	# Keytags of dnskeys that are 'waiting for ds-seen'
@@ -101,13 +106,13 @@ for zone in $zones; do
 	if [ "$activate" == "yes" ]; then
 		if [ "$force" == "yes" ]; then
 			available=$(cat $ods)
-			echo "warning: forced activation of key(s) $available:$zone"
+			echo_time "warning: forced activation of key(s) $available:$zone"
 		fi
 		for keytag in $available; do
 			output=$($KSMUTIL key ds-seen --zone $zone --keytag $keytag 2>&1 | nosql)
 			if [ "$quiet" == "no" ]; then
-				echo "$output"
-				echo "Key $keytag:$zone activated."
+				echo_time "$output"
+				echo_time "Key $keytag:$zone activated."
 			fi
 		done
 	fi
@@ -115,12 +120,12 @@ for zone in $zones; do
 	# logging
 	if [ "$quiet" == "no" ]; then
 		if [ -n "$unavailable" ]; then
-			echo "The key(s) with tag $unavailable:$zone are not present in DNS."
+			echo_time "The key(s) with tag $unavailable:$zone are not present in DNS."
 		else
 			if [ -n "$available" ]; then
-				echo "All keys for $zone are present in DNS."
+				echo_time "All keys for $zone are present in DNS."
 			else
-				echo "No unactivated keys for $zone found in DNS."
+				echo_time "No unactivated keys for $zone found in DNS."
 			fi
 		fi
 	fi
