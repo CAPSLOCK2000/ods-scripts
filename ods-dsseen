@@ -17,8 +17,16 @@
 #
 
 # Config
+# KSMUTIL: if not in path, specify full path to ods-ksmutil
 KSMUTIL="ods-ksmutil"
+# DIG: if not in path, specify full path to dig
 DIG="dig"
+
+# TODO
+# In fact we should _not_ use a /caching/-resolver
+# format: @HOSTNAME or empty to use the default servers
+# server="@dns1.uvt.nl"
+server="@ns0.tilburg1.surf.net"
 
 usage() {
 	echo "usage: $0 [--activate|--force|--quiet|--help] <zone|...>" 
@@ -41,12 +49,6 @@ nosql() {
 ods_version() {
 	$KSMUTIL --version | cut -d ' ' -f 3
 }
-
-# TODO
-# Eigenlijk moet hier _geen_ /caching/-resolver worden gebruikt.
-# formaat: @HOSTNAME of leeg om de default servers te gebruiken
-# server="@dns1.uvt.nl"
-server="@ns0.tilburg1.surf.net"
 
 activate="no" # do not activate by default
 quiet="no"    # be verbose by default
