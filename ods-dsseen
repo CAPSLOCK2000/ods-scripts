@@ -16,6 +16,10 @@
 # - match on CKAID instead of keytag
 #
 
+# Config
+KSMUTIL="ods-ksmutil"
+DIG="dig"
+
 usage() {
 	echo "usage: $0 [--activate|--force|--quiet|--help] <zone|...>" 
 	echo "Check if all DS-records are available through DNS and (optionally) activate the key."
@@ -35,7 +39,7 @@ nosql() {
 
 # get OpenDNSSEC version
 ods_version() {
-	ods-ksmutil --version | cut -d ' ' -f 3
+	$KSMUTIL --version | cut -d ' ' -f 3
 }
 
 # TODO
@@ -59,8 +63,8 @@ do
 		--activate)    activate="yes" ;;
 		--force)       activate="yes" ; force="yes";;
 		--quiet)       quiet="yes" ;;
-		--all)         zones=$(echo " "; ods-ksmutil key list 2>&1 | nosql | egrep -v 'Keys:|Zone:' | awk '/waiting for ds-seen/ {print $1}' | sort -u);;
-		--really-all)  zones=$(echo " "; ods-ksmutil key list 2>&1 | nosql | egrep -v 'Keys:|Zone:' | awk '{print $1}' | sort -u);;
+		--all)         zones=$(echo " "; $KSMUTIL key list 2>&1 | nosql | egrep -v 'Keys:|Zone:' | awk '/waiting for ds-seen/ {print $1}' | sort -u);;
+		--really-all)  zones=$(echo " "; $KSMUTIL key list 2>&1 | nosql | egrep -v 'Keys:|Zone:' | awk '{print $1}' | sort -u);;
 		*)             zones="$zones $option" ;;
 	esac
 done
@@ -81,14 +85,14 @@ ods=$(mktemp)
 for zone in $zones; do
 	# Keytags that can be retrieved from DNS
 	# dig: 39269 8 2 9EC50E7BBCC4095355A776D6183773197C05F320FDDE87E513022DB9 6A1E2F48
-	dig +adflag +aaonly  +short -t DS $zone $server | cut -d ' ' -f 1| sort > $dns
+	$DIG +adflag +aaonly  +short -t DS $zone $server | cut -d ' ' -f 1| sort > $dns
 	if [ ! -s "$dns" ]; then # $dns should never be empty
 		echo "warning: no key(s) for $zone found in DNS at all"
 	fi
 
 	# Keytags of dnskeys that are 'waiting for ds-seen'
 	# ods-ksmutil: mijnuvt.nl  KSK ready  waiting for ds-seen    d3fe6d5bc1ea73bed16d449d42dcf5e7  LocalHSM  39269
-	ods-ksmutil key list -v  --zone $zone 2>&1 |nosql | awk -v col=$keytagcol '/waiting for ds-seen/ {print $col}' |sort -u > $ods
+	$KSMUTIL key list -v  --zone $zone 2>&1 |nosql | awk -v col=$keytagcol '/waiting for ds-seen/ {print $col}' |sort -u > $ods
 
 	available=$(  comm -12 $ods $dns)
 	unavailable=$(comm -23 $ods $dns)
@@ -100,7 +104,7 @@ for zone in $zones; do
 			echo "warning: forced activation of key(s) $available:$zone"
 		fi
 		for keytag in $available; do
-			output=$(ods-ksmutil key ds-seen --zone $zone --keytag $keytag 2>&1 | nosql)
+			output=$($KSMUTIL key ds-seen --zone $zone --keytag $keytag 2>&1 | nosql)
 			if [ "$quiet" == "no" ]; then
 				echo "$output"
 				echo "Key $keytag:$zone activated."
