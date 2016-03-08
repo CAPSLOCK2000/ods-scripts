@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+ 
+# Geef informatie over wanneer bepaalde DNSSEC-gerelateerde acties
+# zullen plaatsvinden voor een bepaald domein, bv wanneer de volgende sign actie is.
+
+# Copyright 2011-2014 Casper Gielen
+# Written for Tilburg University
+# License: GPLv2 or later
+
+
+[[ -z "$1" ]] && echo "usage: $0 <domain>" && exit 1
+
+zone=$1
+echo "Times below are minima, the actual time may be later"
+ods-ksmutil key list -v --zone $zone 2>/dev/null
+ods-signer queue |grep $zone

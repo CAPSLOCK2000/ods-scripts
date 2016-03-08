@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+
+# Inspecteer de agenda van OpenDNSSEC en meldt wat er binnenkort gaat gebeuren
+# specifiek: overzicht van KSKs die de komende maand moeten worden vervangen
+
+# Copyright 2010-2014 Casper Gielen
+# Written for Tilburg University
+# License: GPLv2 or later
+
+
+case "$1" in
+	"--help")
+		echo "usage: $0 [days (default: 30)]"
+		;;
+	*)
+		# by default 30 dagen in de toekomst kijken
+		lookahead=${1-30}
+		;;
+esac
+
+now=$(date "+%s")
+day=$(( 3600 * 24 ))
+
+first="yes"
+
+ods-ksmutil key list | tail -n +3 | grep KSK | grep -v ' retire '  \
+| while read zone type state transition;
+do
+	if [ "$transition" == "waiting for ds-seen" ]; then
+		dif=0; # ASAP
+	else
+		tgt=$(date "+%s" -d "$transition")	# volgende transitie
+		dif=$(( ($tgt - $now) / $day ))		# tijd tot trans
+	fi
+
+	if [ "$dif" -lt "$lookahead" ]; then
+		if [ "$first" == "yes" ]; then		# print header
+			printf "%-26s %s\n" "Next transition" "Zone" 
+			first="no"
+		fi
+		printf "%-26s %s\n" "$transition" "$zone"	
+	fi
+done| sort -n

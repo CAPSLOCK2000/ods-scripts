@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+#
+# $Id: ods-write-trust-anchor 69353 2014-09-02 16:06:19Z cgielen $
+# $URL: https://its-unix-vc.uvt.nl/its-unix/group/dns/opendnssec/usr/local/sbin/ods-write-trust-anchor $
+#
+# Copyright 2013-2014 Casper Gielen
+# Written for Tilburg University
+# License: GPLv2 or later
+
+
+ZONE="$1"
+
+nosql() {
+	egrep -v '^MySQL database' 
+}
+
+ANCHORDIR=/var/lib/unbound/anchors/
+ANCHOR=$ANCHORDIR/$ZONE
+DEBUG=false
+
+mkdir -p $ANCHORDIR
+chown unbound:unbound $ANCHORDIR
+
+$DEBUG && echo -n "$ZONE:"
+KEYS=$(ods-ksmutil key export --zone $ZONE 2>&1 | nosql)
+
+if echo $KEYS | grep -q 'in DB but not repository'; then
+	echo "$KEYS"
+	echo "HSM-failure or database-corruption, ignoring missing keys..."
+	KEYS=$(echo $KEYS | grep -v 'in DB but not repository')
+fi
+
+if echo $KEYS | grep -q CKR; then
+	echo "$KEYS"
+	echo "HSM-failure, aborting... "
+	exit 1
+fi
+
+if ! echo $KEYS | grep -q DNSKEY; then
+	echo "$KEYS"
+	echo "HSM-failure, no DNSKEY-found, nothing to do."
+	exit 1
+fi
+
+echo "$KEYS" > $ANCHOR
+
+if [ ! -s $ANCHOR ]; then
+	echo "empty anchor!"
+	exit 1
+fi
+
+chown unbound:unbound $ANCHOR
+if $DEBUG; then
+	for id in $(sed  -n  's/.*id = \([[:digit:]]*\).*/\1/p' $ANCHOR); do
+		echo -n " $id"
+	done
+	echo "."
+fi

@@ -1,0 +1,248 @@
+#!/bin/sh
+# $Id: ods-ha 76514 2015-12-17 16:24:58Z cgielen $
+# $URL: https://svn.uvt.nl/its-unix/group/dns/opendnssec/usr/local/sbin/ods-ha $
+#
+# Copyright 2014 Casper Gielen
+# Written for Tilburg University
+# license: GPLv3+
+
+# This script provides High Availability for OpenDNSSEC.
+# - sync data from active node (master) to the passive node (slave)
+# - switch between master and slave
+# There is no automatic failover; it is manually activated with 'ods-ha master'.
+# 
+# See "usage" for details.
+
+
+server1=ramanujan
+server2=ramachandra
+extra=metagross
+
+# Do not actually write anything to disk
+# This allows for testing the starting & stopping of various parts
+# without actually overwriting productie.
+DISABLE_WRITE=0
+
+# the basedir that contains the data-directories
+DATADIR="/var/lib"
+
+# this file defines if this node is the master or the slave
+STATE=/var/lib/nsd3/ods-ha.state
+
+# SSH command with any options
+SSH="/usr/bin/ssh -o ConnectTimeout=3"
+
+RSYNC="/usr/bin/rsync"
+# copy
+if [ "$DISABLE_WRITE" -eq 1 ];
+then
+	RSYNC="echo $RSYNC"
+fi
+
+HOSTNAME=$(hostname)
+
+# standard init stuff: start, stop, status for all daemons
+start() {
+	echo "Starting services on $HOSTNAME."
+	/usr/sbin/service mysql start
+	/usr/sbin/service opendnssec-signer start >/dev/null
+	/usr/sbin/service opendnssec-enforcer start
+}
+
+stop() {
+	echo "Stopping /usr/sbin/services on $HOSTNAME."
+	/usr/sbin/service opendnssec-enforcer stop
+	/usr/sbin/service opendnssec-signer stop
+	/usr/sbin/service mysql stop
+}
+
+status() {
+	echo "$HOSTNAME is in $(cat $STATE)-mode"
+	/usr/sbin/service mysql status && \
+	/usr/sbin/service opendnssec-enforcer status && \
+	/usr/sbin/service opendnssec-signer status
+}
+
+# send all data (mysql, softhsm, opendnssec) from localhost to the destination with rsync
+# $1 = host to send data to
+send() {
+	if [ -n "$1" ];
+	then
+		destination="$1"
+	else
+		destination=$(otherhost $HOSTNAME)
+	fi
+	is_slave && die "Refusing to send data: this node is in slave mode."
+	$SSH $destination is_master && die "Refusing to send data: $destination is in master mode."
+	[ "$?" -eq "255" ] && die "$destination is unreachable."
+	$SSH $destination stop
+	sleep 1
+	stop
+	sleep 1
+	$RSYNC -e "$SSH" -av --delete $DATADIR/mysql $DATADIR/softhsm $DATADIR/opendnssec $destination:$DATADIR/
+	sleep 1
+	start
+	sleep 1
+	$SSH $destination start
+}
+
+# wrapper for send to be used by cronjobs
+# $1 = host to send data to
+send_cron()
+{
+	is_slave && exit 0
+	send $1
+}
+
+
+# receive data with rsync
+receive() {
+	is_master && die "Refusing to receive data: this node is in master mode." # you will never see this message, but it will break rsync and that's what we need
+	$RSYNC --server -vlogDtpre.iLsf --delete . $DATADIR
+}
+
+# make localhost master
+master() {
+	echo master > $STATE
+	cp /etc/nsd3/uvt-includes.conf-master /etc/nsd3/uvt-includes.conf
+	service nsd3 restart
+}
+
+# make localhost slave
+slave() {
+	echo slave > $STATE
+	cp /etc/nsd3/uvt-includes.conf-slave /etc/nsd3/uvt-includes.conf
+	service nsd3 restart
+}
+
+# check if localhost is in master or slave mode
+is_master() {
+	grep -q master $STATE
+}
+
+is_slave() {
+	grep -q slave $STATE
+}
+
+# the hostname of the other host in this master/slave combo
+# $1 = hostname
+otherhost() {
+	hostname="$1"
+	case $hostname in
+		$server1) echo $server2 ;;
+		$server2) echo $server1 ;;
+		$extra) die "No failover partner for metagross" ;;
+		*) die "Unknown hostname '$HOSTNAME'"
+	esac
+}
+
+# Perform a master failover/failback to this host.
+# The source does not have to be online.
+failover() {
+	target=$HOSTNAME
+	source=$(otherhost $HOSTNAME)
+
+	echo "MAKE THIS NODE ($target) THE NEW MASTER."
+	echo
+	echo "This procedure will copy all data from $source to $target,"
+	echo "if that's still possible, and make $target the new master."
+	echo "When in doubt you should perform this procedure manually."
+	echo "See the usage-information for detailed steps."
+	echo
+	echo -n "Do you want to continue with the automated procedure? (yes/no) "
+	read answer
+	case $answer in
+		yes) ;;
+		*) die "Failover aborted by user."
+	esac
+
+	is_master && die "This host is already in master-mode. Double-check what you want  and use the manual procedure!"
+
+
+	$SSH $source send
+	$SSH $source slave
+	master
+}
+
+print_usage() {
+cat >&2 <<EOF
+Copy OpenDNSSEC-data to another host and switch between master and slave mode.
+usage: ods-ha <COMMAND>
+
+COMMAND :=  <failover>
+COMMAND :=  <send|send_cron> [target]
+COMMAND :=  <master|slave>
+COMMAND :=  <start|stop|status|receive>
+
+You should only need 'failover'.
+During a manual failover you will use 'send', 'master' and 'slave'.
+All other commands are for internal use.
+
+failover   copy all data and make this node the new master
+send       send all data from this node to the other node
+send_cron  like send but fails silently on the slave node (for cron)
+master     make this node the master (do not copy data)
+slave      make this node the slave (do not copy data)
+start      start mysql, nsd and opendnssec
+stop       stop mysql, nsd and opendnssec
+status     show the current status of the system
+receive    accept an rsync-connection from the other host
+
+Automatic failover
+ramachandra# ods-ha failover
+
+Manual failover (same result as automatic failover)
+ramachandra# ods-ha slave              # optional
+ramanujan#   ods-ha send ramachandra   # optional
+ramanujan#   ods-ha slave              # optional
+ramachandra# ods-ha master             # required
+
+The optional steps ensure that all data is in sync and should be performed
+manually during a controlled failover.
+EOF
+}
+
+# When in danger or in doubt,
+# run in circles, scream and shout
+#
+# $1    string to print
+# $2    exit with this return value (optional, defaults to 1)
+die() {
+	echo "Fatal error on $HOSTNAME:" >&2
+	echo "$1" >&2
+	echo "$HOSTNAME aborting." >&2
+	[ -n "$2" ] && exit $2
+	exit 1
+	echo "what the flip???" >&2
+}
+
+# When using SSH use the options of the original
+# call instead of those of the forced command.
+if [ -n "$SSH_ORIGINAL_COMMAND" ];
+then
+	COMMAND="${SSH_ORIGINAL_COMMAND##$SCRIPT_LOCATION }"
+else
+	COMMAND="$1"
+fi
+
+# second commandline argument specificies the copy destination
+[ -n "$2" ] && destination="$2"
+[ "$destination" = "$HOSTNAME" ] && die "Wrong host!"
+
+
+case "$COMMAND" in
+	failover)  failover ;;
+	stop)      stop ;;
+	start)     start ;;
+	master)    master ;;
+	slave)     slave ;;
+	is_master) is_master ;;
+	is_slave)  is_slave ;;
+	status)    if [ -z "$destination" ]; then status; else $SSH $destination status; fi ;;
+	rsync*)    receive;;
+	send)      send $destination ;;
+	send_cron) send_cron $destination ;;
+	*)         print_usage ; exit 1 ;;
+esac
+
+

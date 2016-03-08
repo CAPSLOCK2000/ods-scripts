@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# $Id: ods-uploadkeys 76241 2015-12-08 12:31:09Z cgielen $
+# $URL: https://svn.uvt.nl/its-unix/group/dns/opendnssec/usr/local/sbin/ods-uploadkeys $
+#
+# Copyright 2013-2014 Casper Gielen
+# Written for Tilburg University
+# License: GPLv2 or later
+
+# 
+# Dit script upload alle keys die OpenDNSSEC kent voor een domein naar SIDN.
+# Andere TLDs worden nog niet ondersteunt.
+#
+
+logdir=/var/log/dnssec/ods-uploadkeys
+keystates="GENERATE PUBLISH READY ACTIVE RETIRE DSSUB DSPUBLISH DSREADY KEYPUBLISH"
+
+# lijst met domeinen
+domeinen=/usr/local/etc/domeinen/domeinnamen.txt
+# kolom met de provider
+providercol=3
+
+usage() {
+	echo "usage: $0 <domain>"
+	echo "Upload all DNSKEYS for a domain replacing any previous ones"
+	echo "-h|--help)   Show this text."
+	echo "-q|--quiet)  Be very quiet"
+	echo "-v|--verbose Be more verbose"
+	echo "-p|--pending Upload keys that are pending for upload"
+	echo "-a|--all     Upload keys for all domains"
+}
+
+# cli options
+until [ -z "$*" ];
+do
+        option="$1"
+        shift
+        case $option in
+                -h|--help)     usage ;;
+                -q|--quiet)    QUIET="yes" ;;
+                -v|--verbose)  QUIET="no" ;;
+                -p|--pending)  zones=$(echo " "; ods-ksmutil key list 2>&1 | egrep 'seen|backup'    | awk '{print $1}' | sort -u);;
+                -a|--all)      zones=$(echo " "; ods-ksmutil key list 2>&1 | egrep -v 'Keys:|Zone:' | awk '{print $1}' | sort -u);;
+                *)             zones="$zones $option" ;;
+        esac
+done
+
+
+mkdir -p $logdir
+
+# upload de keys voor $zone naar SIDN
+# $1 = $zone
+sidn() {
+	zone="$1"
+	log="$logdir/$zone.log"
+	for state in $keystates; 
+	do
+		ods-ksmutil key export --zone $zone --keystate $state
+	done \
+	| grep "^$zone" \
+	| awk '{print $5,$6,$7,$8}' \
+	| tee -a $log \
+	| /usr/local/sbin/epp-replace $zone
+}
+
+transip() {
+	zone="$1"
+	[ "$QUIET" == "no" ] && echo "Unable to upload keys for '$zone'. TransIP does not support it. Upload the keys manually."
+}
+
+# onbekende provider
+unknown() {
+	zone="$1"
+	provider="$2"
+	[ "$QUIET" == "no" ] && echo "Unable to upload keys for '$zone'. Provider '$provider' is not supported."
+}
+
+# zoek uit welke provider verantwoordelijk is voor deze zone
+# $1 = $zone
+getprovider() {
+	awk -v zone="^$1" -v providercol="$providercol" '$1 ~ zone {print $providercol}' "$domeinen"
+}
+
+for zone in $zones;
+do
+	log="$logdir/$zone.log"
+	date >> $log
+	[ "$QUIET" == "no" ] && echo "Uploading DNSSEC-keys for zone '$zone'."
+	
+	provider=$(getprovider $zone)
+	case "$provider" in
+		SIDN)		sidn $zone ;;
+		Transip)	transip $zone ;;
+		*)		unknown $zone $provider ;;
+	esac
+
+done

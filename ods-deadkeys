@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+
+# $Id: ods-deadkeys 69353 2014-09-02 16:06:19Z cgielen $
+# $URL: https://its-unix-vc.uvt.nl/its-unix/group/dns/opendnssec/usr/local/sbin/ods-deadkeys $
+#
+# Make an overview of Key Siging Keys in DNS that are dead/unknown
+# and attempt to remove them.
+# After 2 weeks dead keys are purged from OpenDNSSEC.
+# 
+# Copyright 2013-2014 Casper Gielen
+# Written for Tilburg University
+# License: GPLv2 or later
+#
+# version: 2014022501
+
+usage() {
+	echo "usage: $0 [--help|--all|--quiet] [zone|...]" 
+	echo "List dead and unknown DS-records"
+	echo "If no zones are specified all will be checked."
+	echo "--help         Display this help text."
+	echo "--quiet        Surpress output."
+	echo "--remove       remove dead/unknown keys from upstream DNS (only .nl)."
+	echo "--all          Apply to all zones with retired KSKs."
+	echo "--really-all   Apply to all zones, required or not."
+	echo ""
+	echo "Properly cleaned up :-)"
+	echo "Good. The key has been removed from DNS as it should be."
+        echo "ODS will eventually remove this key from the databsae."
+	echo "You do not have to do anything."
+	echo ""
+	echo "Dead key in DNS :-/"
+	echo "OK. This key is no longer in use and has been retired. Now is"
+	echo "the appropriate time to remove it from the parent DNS."
+	echo "Leaving old keys around causes extra strain on DNS."
+	echo "Remove this key now."
+	echo ""
+	echo "Unknown key in DNS :-("
+	echo "Bad. We know nothing about this key. Probably a mistake"
+	echo "while uploading new keys."
+	echo "Remove the key from the parent DNS after veryfing that it is"
+	echo "not being used anymore."
+
+	exit -1
+}
+
+nosql() {
+	egrep -v '^MySQL database' 
+}
+
+nounseen() {
+	egrep -v 'waiting for ds-seen' 
+}
+
+quiet="no"    # explain decisions
+verbose="no"  # also inform about properly cleaned files
+remove="no"   # remove dead/unknown keys from upstream DNS
+zones=""
+
+# cut the name of the zones from the output of ods-ksmutil key export
+# example.com.  3600    IN      DNSKEY  257 3 8 AwEA...lRxyJTs= ;{id = 56330 (ksk), size = 2048b}
+cutzones()
+{
+	sed -n 's/\(.*\)\..*IN\t*DNSKEY\t*257.*/\1/gp'
+}
+
+# cut the keytags from the output of ods-ksmutil key export
+cuttags()
+{
+	sed -n 's/.*;{id = \(.*\) (ksk), size.*/\1/gp'
+}
+
+# all zones know to ODS
+# example.com                     ZSK           active    2013-03-30 17:12:45    
+listzones()
+{
+	echo " "	#FIXME
+	ods-ksmutil key list 2>&1 | nosql | awk '{print $1}' | sort -u
+}
+
+# all zones with dead keys
+listdeadzones()
+{
+	echo " "	#FIXME
+	ods-ksmutil key export --keystate dead 2>&1 | nosql | cutzones | sort -u
+}
+
+# all tags for a zone
+# $1 target zone
+# $2 keystate(s)
+listtags()
+{
+	zone="$1"
+	states=${2:-"publish ready active retire dead"}
+	for state in $states; do
+		ods-ksmutil key export --keytype KSK --keystate $state --zone $zone 2>&1 
+	done | nosql | cuttags | sort -u
+}
+
+
+# cli options
+until [ -z "$*" ];
+do
+        option="$1"
+        shift
+        case $option in
+                -h|--help)     usage ;;
+                --quiet)       quiet="yes" ;;
+                --verbose)     verbose="yes" ;;
+		--remove)      remove="yes" ;;
+		--all)         zones=$(listdeadzones);;
+		--really-all)  zones=$(listzones);;
+                *)             zones="$zones $option" ;;
+        esac
+done
+
+if [ -z "$zones" ]; then
+	zones=$(listdeadzones)
+fi
+
+if [ -z "$zones" ]; then
+	echo "De volgende oude DNSKEYS staan nog in DNS."
+fi
+
+# del empty lines
+zones=$(echo $zones | sed '/^$/d')
+
+worktodo=0
+
+for zone in $zones; do
+	# Keytags that can be retrieved from DNS
+	# dig: 39269 8 2 9EC50E7BBCC4095355A776D6183773197C05F320FDDE87E513022DB9 6A1E2F48
+	dns=$(dig +adflag +aaonly  +short -t DS $zone | cut -d ' ' -f 1)
+
+	# All keytags known for this zone by ODS.
+	ods=$(listtags $zone)
+
+	# Just the tags of dead keys
+	# ods-ksmutil: mijnuvt.nl  KSK retire  2013-03-24 13:25:41    d3fe6d5bc1ea73bed16d449d42dcf5e7  LocalHSM  39269
+	rip=$(listtags $zone dead)
+	
+	isclean=$(echo "$ods" | grep -v -x -F "$dns" | tr '\n' ' ' | sed 's/[ ]*$//g')
+	toclean=$(echo "$rip" | grep    -x -F "$dns" | tr '\n' ' ' | sed 's/[ ]*$//g')
+	unknown=$(echo "$dns" | grep -v -x -F "$ods" | tr '\n' ' ' | sed 's/[ ]*$//g')
+
+	if [ "$quiet" == "no" ]; then
+		if [ "$verbose" == "yes" ]; then
+		[ -n "$isclean" ] &&  printf "Properly cleaned up :-) %50s %s\n" $zone "$isclean"
+		fi
+		[ -n "$toclean" ] &&  printf "Dead keys in DNS    :-/ %50s %s\n" $zone "$toclean"
+		[ -n "$unknown" ] &&  printf "Unknown key in DNS  :-( %50s %s\n" $zone "$unknown"
+	fi
+	if [ -n "${toclean}${unknown}" ]; then
+		if [ "$remove" == "yes" ]; then
+			/usr/local/sbin/ods-uploadkeys $zone
+		else
+			printf "%-50s %s\n" "$zone" "$(echo $toclean $unknown| sort -u)"
+		fi
+
+	fi
+done
+
+[ "$worktodo" == "1" ] && echo "Please remove these keys from DNS as soon as possible!"
+exit 0

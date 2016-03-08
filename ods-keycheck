@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# $Id: ods-keycheck 77718 2016-02-22 11:44:50Z cgielen $
+# $URL: https://svn.uvt.nl/its-unix/group/dns/opendnssec/usr/local/sbin/ods-keycheck $
+
+# Copyright 2011-2014 Casper Gielen
+# Written for Tilburg University
+# License: GPLv2 or later
+
+BASIC_STATES="READY PUBLISHED"
+EXTRA_STATES="ACTIVE RETIRED DEAD"
+
+usage()
+{
+	echo "Print DNSSEC Key Siging Keys to be published in the upstream DNS."
+	echo "--all-keys    print all keys, not just those that need publishing."
+	echo "--all-zones   print keys for all zones, not just those that need publishing."
+	echo "--help   print this message."
+	exit 1
+}
+
+
+states=" "
+zones=" "
+case "$1" in
+	--all-keys)  states="all" ;;
+	--all-zones) zones="all" ;;
+	--all)       states="all"; zones="all" ;;
+	-*)          usage ;;
+
+esac
+
+if [ "$states" = "all" ]; then
+	states="$BASIC_STATES $EXTRA_STATES"
+else
+	states="$BASIC_STATES"
+fi
+
+if [ "$zones" == "all" ]; then
+	zones=$(ods-ksmutil key list 2>&1                    | cut -d ' ' -f 1| sort -u | tr '\n' ' ')
+else
+	zones=$(ods-ksmutil key list 2>&1|egrep 'seen|backup'| cut -d ' ' -f 1| sort -u | tr '\n' ' ')
+fi
+[ -z "$zones" ] && exit 0	# nothing to do
+
+echo "Summary: $zones"
+
+echo
+echo "Keys:"
+for zone in $zones; do
+	for state in $states; do
+		ods-ksmutil key export --zone $zone --keystate $state -t KSK      2>&1 | egrep 'IN[[:space:]]+DNSKEY[[:space:]]+257'
+		ods-ksmutil key export --zone $zone --keystate $state -t KSK --ds 2>&1 | egrep 'IN[[:space:]]+DS[[:space:]]+[[:digit:]]+'
+	done
+done
+
+echo
+echo "Summary: $zones"

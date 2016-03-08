@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+
+# $Id: receive-dnskeys 69353 2014-09-02 16:06:19Z cgielen $
+# $URL: https://its-unix-vc.uvt.nl/its-unix/group/dns/opendnssec/usr/local/sbin/receive-dnskeys $
+
+# Copyright 2013-2014 Casper Gielen
+# Written for Tilburg University
+# License: GPLv2 or later
+
+
+#
+# Dit script ontvangt nieuwe DNSKEYs van OpenDNSSEC.
+# Deze keys moeten in de (juiste) parent-zone worden gepubliceerd.
+# Tijdens de testperiode moeten deze keys aan unbound worden gevoerd.
+#
+# Dit script doet niks met de ontvangen keys maar geeft alleen het domein door
+# aan ods-uploadkey. Dat script bepaalt zelf welke keys moeten worden geupload.
+
+ZONES=""
+LOG=/var/log/dnssec/receive-keys.log
+date >> $LOG
+while read line;
+do
+	echo "$line" >> $LOG
+	echo "$line" | grep -vq DNSKEY && continue
+
+	ZONE=$(echo $line | cut -d ' ' -f 1)	# first word
+	ZONE=${ZONE%.}				# strip leading dot
+#	TLD=${ZONE##.*}				# tld
+
+	ZONES="$ZONE\n$ZONES"
+done 
+
+for ZONE in $( echo -e $ZONES | sort -u);
+do
+	if grep -q "^${ZONE}$" /usr/local/etc/domeinen/dnssec.conf;
+	then
+		/usr/local/sbin/ods-uploadkeys $ZONE >> $LOG
+	else
+		echo "Not uploading non-dnssec-domain $ZONE" >> $LOG
+	fi
+done
