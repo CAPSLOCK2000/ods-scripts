@@ -12,5 +12,6 @@
 
 zone=$1
 echo "Times below are minima, the actual time may be later"
-ods-ksmutil key list -v --zone $zone 2>/dev/null
+ods-enforcer key list --verbose --zone $zone 2>/dev/null
+ods-enforcer key list --debug   --zone $zone 2>/dev/null
 ods-signer queue |grep $zone

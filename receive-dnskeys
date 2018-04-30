@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # $Id: receive-dnskeys 69353 2014-09-02 16:06:19Z cgielen $
-# $URL: https://its-unix-vc.uvt.nl/its-unix/group/dns/opendnssec/usr/local/sbin/receive-dnskeys $
+# $URL: https://svn.uvt.nl/its-unix/systems/metagross/usr/local/sbin/receive-dnskeys $
 
 # Copyright 2013-2014 Casper Gielen
 # Written for Tilburg University

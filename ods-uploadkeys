@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# $Id: ods-uploadkeys 76241 2015-12-08 12:31:09Z cgielen $
-# $URL: https://svn.uvt.nl/its-unix/group/dns/opendnssec/usr/local/sbin/ods-uploadkeys $
+# $Id: ods-uploadkeys 94814 2018-04-30 16:24:09Z cgielen $
+# $URL: https://svn.uvt.nl/its-unix/systems/metagross/usr/local/sbin/ods-uploadkeys $
 #
 # Copyright 2013-2014 Casper Gielen
 # Written for Tilburg University
@@ -12,7 +12,10 @@
 #
 
 logdir=/var/log/dnssec/ods-uploadkeys
-keystates="GENERATE PUBLISH READY ACTIVE RETIRE DSSUB DSPUBLISH DSREADY KEYPUBLISH"
+
+# Keys in the following states should be published in DNS
+# (Add 'retire' and 'dead' to stop this script from removing old keys.)
+publish_keystates="publish ready active"
 
 # lijst met domeinen
 domeinen=/usr/local/etc/domeinen/domeinnamen.txt
@@ -38,8 +41,8 @@ do
                 -h|--help)     usage ;;
                 -q|--quiet)    QUIET="yes" ;;
                 -v|--verbose)  QUIET="no" ;;
-                -p|--pending)  zones=$(echo " "; ods-ksmutil key list 2>&1 | egrep 'seen|backup'    | awk '{print $1}' | sort -u);;
-                -a|--all)      zones=$(echo " "; ods-ksmutil key list 2>&1 | egrep -v 'Keys:|Zone:' | awk '{print $1}' | sort -u);;
+                -p|--pending)  zones=$(echo " "; ods-enforcer key list 2>&1 | egrep 'seen|backup|publish' | awk '{print $1}' | sort -u);;
+                -a|--all)      zones=$(echo " "; ods-enforcer key list 2>&1 | egrep -v 'Keys:|Zone:'      | awk '{print $1}' | sort -u);;
                 *)             zones="$zones $option" ;;
         esac
 done
@@ -52,9 +55,9 @@ mkdir -p $logdir
 sidn() {
 	zone="$1"
 	log="$logdir/$zone.log"
-	for state in $keystates; 
+	for state in $publish_keystates;
 	do
-		ods-ksmutil key export --zone $zone --keystate $state
+		ods-enforcer key export --zone $zone --keystate $state 2>&1
 	done \
 	| grep "^$zone" \
 	| awk '{print $5,$6,$7,$8}' \

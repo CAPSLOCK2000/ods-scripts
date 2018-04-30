@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# $Id: ods-write-trust-anchor 69353 2014-09-02 16:06:19Z cgielen $
-# $URL: https://its-unix-vc.uvt.nl/its-unix/group/dns/opendnssec/usr/local/sbin/ods-write-trust-anchor $
+# $Id: ods-write-trust-anchor 90334 2017-10-25 12:54:04Z cgielen $
+# $URL: https://svn.uvt.nl/its-unix/systems/metagross/usr/local/sbin/ods-write-trust-anchor $
 #
 # Copyright 2013-2014 Casper Gielen
 # Written for Tilburg University
@@ -22,7 +22,7 @@ mkdir -p $ANCHORDIR
 chown unbound:unbound $ANCHORDIR
 
 $DEBUG && echo -n "$ZONE:"
-KEYS=$(ods-ksmutil key export --zone $ZONE 2>&1 | nosql)
+KEYS=$(ods-enforcer key export --zone $ZONE 2>&1 | nosql)
 
 if echo $KEYS | grep -q 'in DB but not repository'; then
 	echo "$KEYS"

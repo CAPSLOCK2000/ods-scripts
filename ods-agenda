@@ -3,18 +3,26 @@
 # Inspecteer de agenda van OpenDNSSEC en meldt wat er binnenkort gaat gebeuren
 # specifiek: overzicht van KSKs die de komende maand moeten worden vervangen
 
-# Copyright 2010-2014 Casper Gielen
+# todo: ods-enforcer rollover list overwegen
+
+# Copyright 2010-2017 Casper Gielen
 # Written for Tilburg University
 # License: GPLv2 or later
 
+usage() {
+	echo "usage: $0 [days (default: 30)]"
+	exit 1
+}
 
 case "$1" in
 	"--help")
-		echo "usage: $0 [days (default: 30)]"
+		usage
 		;;
 	*)
-		# by default 30 dagen in de toekomst kijken
+		# by default look 30 days into the futue
 		lookahead=${1-30}
+		# input validation
+		echo $lookahead |  egrep -q '^[0-9]+$' || usage
 		;;
 esac
 
@@ -23,10 +31,10 @@ day=$(( 3600 * 24 ))
 
 first="yes"
 
-ods-ksmutil key list | tail -n +3 | grep KSK | grep -v ' retire '  \
+ods-enforcer key list | tail -n +3 | grep KSK | grep -v ' retire '  \
 | while read zone type state transition;
 do
-	if [ "$transition" == "waiting for ds-seen" ]; then
+	if [ "$transition" == "waiting for ds-" ]; then
 		dif=0; # ASAP
 	else
 		tgt=$(date "+%s" -d "$transition")	# volgende transitie

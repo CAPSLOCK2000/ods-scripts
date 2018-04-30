@@ -1,6 +1,6 @@
 #!/bin/sh
-# $Id: ods-ha 76514 2015-12-17 16:24:58Z cgielen $
-# $URL: https://svn.uvt.nl/its-unix/group/dns/opendnssec/usr/local/sbin/ods-ha $
+# $Id: ods-ha 90500 2017-11-01 16:19:17Z cgielen $
+# $URL: https://svn.uvt.nl/its-unix/systems/metagross/usr/local/sbin/ods-ha $
 #
 # Copyright 2014 Casper Gielen
 # Written for Tilburg University
@@ -12,7 +12,6 @@
 # There is no automatic failover; it is manually activated with 'ods-ha master'.
 # 
 # See "usage" for details.
-
 
 server1=ramanujan
 server2=ramachandra
@@ -26,8 +25,9 @@ DISABLE_WRITE=0
 # the basedir that contains the data-directories
 DATADIR="/var/lib"
 
-# this file defines if this node is the master or the slave
-STATE=/var/lib/nsd3/ods-ha.state
+# This file defines if this node is the master or the slave
+# It is not automatically created when missing to avoid mistakes.
+STATE=/var/lib/nsd/ods-ha.state
 
 # SSH command with any options
 SSH="/usr/bin/ssh -o ConnectTimeout=3"
@@ -43,21 +43,24 @@ HOSTNAME=$(hostname)
 
 # standard init stuff: start, stop, status for all daemons
 start() {
-	echo "Starting services on $HOSTNAME."
+	echo "Starting services on $HOSTNAME"
+	/usr/sbin/service nsd start
 	/usr/sbin/service mysql start
 	/usr/sbin/service opendnssec-signer start >/dev/null
 	/usr/sbin/service opendnssec-enforcer start
 }
 
 stop() {
-	echo "Stopping /usr/sbin/services on $HOSTNAME."
-	/usr/sbin/service opendnssec-enforcer stop
-	/usr/sbin/service opendnssec-signer stop
-	/usr/sbin/service mysql stop
+	echo "Stopping services on $HOSTNAME."
+	/usr/sbin/service opendnssec-enforcer stop >/dev/null 2>&1
+	/usr/sbin/service opendnssec-signer stop >/dev/null 2>&1
+	/usr/sbin/service mysql stop >/dev/null 2>&1
+	/usr/sbin/service nsd stop
 }
 
 status() {
 	echo "$HOSTNAME is in $(cat $STATE)-mode"
+	/usr/sbin/service nsd status && \
 	/usr/sbin/service mysql status && \
 	/usr/sbin/service opendnssec-enforcer status && \
 	/usr/sbin/service opendnssec-signer status
@@ -104,15 +107,17 @@ receive() {
 # make localhost master
 master() {
 	echo master > $STATE
-	cp /etc/nsd3/uvt-includes.conf-master /etc/nsd3/uvt-includes.conf
-	service nsd3 restart
+	cp /etc/nsd/uvt-includes.conf-master /etc/nsd/uvt-includes.conf
+	service nsd restart
+	echo "NODE '$HOSTNAME' IS NOW THE MASTER."
 }
 
 # make localhost slave
 slave() {
 	echo slave > $STATE
-	cp /etc/nsd3/uvt-includes.conf-slave /etc/nsd3/uvt-includes.conf
-	service nsd3 restart
+	cp /etc/nsd/uvt-includes.conf-slave /etc/nsd/uvt-includes.conf
+	service nsd restart
+	echo "NODE '$HOSTNAME' IS NOW A SLAVE."
 }
 
 # check if localhost is in master or slave mode
@@ -228,6 +233,16 @@ fi
 # second commandline argument specificies the copy destination
 [ -n "$2" ] && destination="$2"
 [ "$destination" = "$HOSTNAME" ] && die "Wrong host!"
+
+if [ ! -e "$STATE" ]; then
+	echo "Unable to read state from $STATE, aborting." >&2
+	exit 1
+fi
+
+if ! grep -q '^/dev/mapper/softhsm /var/lib/softhsm xfs' /proc/mounts; then
+	echo "SoftHSM not mounted, refusing operation!" >&2
+	exit 2
+fi
 
 
 case "$COMMAND" in

@@ -1,33 +1,47 @@
 #!/usr/bin/env bash
-# $Id: ods-keycheck 77718 2016-02-22 11:44:50Z cgielen $
-# $URL: https://svn.uvt.nl/its-unix/group/dns/opendnssec/usr/local/sbin/ods-keycheck $
+# $Id: ods-keycheck 94810 2018-04-30 16:20:56Z cgielen $
+# $URL: https://svn.uvt.nl/its-unix/systems/metagross/usr/local/sbin/ods-keycheck $
 
-# Copyright 2011-2014 Casper Gielen
+# Copyright 2011-2017 Casper Gielen
 # Written for Tilburg University
 # License: GPLv2 or later
 
-BASIC_STATES="READY PUBLISHED"
-EXTRA_STATES="ACTIVE RETIRED DEAD"
+
+# todo:
+#  - find an authorative list of ODS states
+#    https://wiki.opendnssec.org/display/DOCS/Key+States
+#    https://wiki.opendnssec.org/display/DOCS20/Key+States+Explained
+#  - reconsider the proper use of the standby KSK states
+
+BASIC_STATES="publish ready dssub dspublish"
+EXTRA_STATES="active retire revoke dead dsready keypublish"
 
 usage()
 {
+	echo "usage: $0 [--all-keys|--all-zones|-all] [zones]"
 	echo "Print DNSSEC Key Siging Keys to be published in the upstream DNS."
 	echo "--all-keys    print all keys, not just those that need publishing."
 	echo "--all-zones   print keys for all zones, not just those that need publishing."
-	echo "--help   print this message."
+	echo "--all         print all keys for all zones."
+	echo "[zones]       optional list of zones to operate on."
+	echo "--help        print this message."
 	exit 1
 }
 
 
-states=" "
-zones=" "
-case "$1" in
-	--all-keys)  states="all" ;;
-	--all-zones) zones="all" ;;
-	--all)       states="all"; zones="all" ;;
-	-*)          usage ;;
-
-esac
+states=""
+zones=""
+while [ -n "$*" ]; do
+	arg="$1"
+	shift
+	case $arg in
+		--all-keys)  states="all" ;;
+		--all-zones) zones="all" ;;
+		--all)       states="all"; zones="all" ;;
+		-*)          usage ;;
+		*)           zones="$zones $arg"
+	esac
+done
 
 if [ "$states" = "all" ]; then
 	states="$BASIC_STATES $EXTRA_STATES"
@@ -35,11 +49,19 @@ else
 	states="$BASIC_STATES"
 fi
 
+# make regex from filter
+state_filter=$(echo $BASIC_STATES| tr ' ' '|')
+
+# get list of /all/ zones
 if [ "$zones" == "all" ]; then
-	zones=$(ods-ksmutil key list 2>&1                    | cut -d ' ' -f 1| sort -u | tr '\n' ' ')
-else
-	zones=$(ods-ksmutil key list 2>&1|egrep 'seen|backup'| cut -d ' ' -f 1| sort -u | tr '\n' ' ')
+	zones=$(ods-enforcer key list -v -p 2>&1 | awk                           'BEGIN { FS=";" }             {print $1}' | sort -u | tr '\n' ' ')
 fi
+
+# get list of zones that need to publish a key
+if [ -z "$zones" ]; then
+	zones=$(ods-enforcer key list -v -p 2>&1 | awk -v filter="$state_filter" 'BEGIN { FS=";" } $2 ~ /KSK/ && $3 ~ filter {print $1}' | sort -u | tr '\n' ' ')
+fi
+
 [ -z "$zones" ] && exit 0	# nothing to do
 
 echo "Summary: $zones"
@@ -48,8 +70,8 @@ echo
 echo "Keys:"
 for zone in $zones; do
 	for state in $states; do
-		ods-ksmutil key export --zone $zone --keystate $state -t KSK      2>&1 | egrep 'IN[[:space:]]+DNSKEY[[:space:]]+257'
-		ods-ksmutil key export --zone $zone --keystate $state -t KSK --ds 2>&1 | egrep 'IN[[:space:]]+DS[[:space:]]+[[:digit:]]+'
+		ods-enforcer key export --zone $zone --keystate $state -t KSK      2>&1 | egrep 'IN[[:space:]]+DNSKEY[[:space:]]+257'
+		ods-enforcer key export --zone $zone --keystate $state -t KSK --ds 2>&1 | egrep 'IN[[:space:]]+DS[[:space:]]+[[:digit:]]+'
 	done
 done
 

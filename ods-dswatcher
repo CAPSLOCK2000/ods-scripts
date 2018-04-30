@@ -1,0 +1,529 @@
+#!/usr/bin/env bash
+
+# $Id: ods-dswatcher 94813 2018-04-30 16:22:10Z cgielen $
+# $URL: https://svn.uvt.nl/its-unix/systems/metagross/usr/local/sbin/ods-dswatcher $
+#
+# Check if new DSes have been published in DNS and activate them, also deactives old DSes that have been removed.
+# 
+# 
+# Copyright 2013-2018 Casper Gielen
+# Written for Tilburg University
+# License: GPLv2 or later
+
+#
+# TODO
+# - use dig ods-enforcer in batch-mode instead of making seperate calls for each zone
+# - match on CKAID instead of keytag
+# - what to do about unknown keys? ignore? report?
+
+#set -x
+
+# DIG: if not in path, specify full path to dig
+DIG="/usr/bin/dig"
+# DIGP: DIG used for finding parent info
+DIGP="/usr/bin/dig"
+
+logfile=/var/log/dnssec/ods-dswatcher.log
+
+# requires shunit2 to be installed
+USE_SHUNIT=false
+
+usage() {
+	echo "usage: $0 [--activate|--force|--quiet|--help] <zone|...>" 
+	echo "Check if all DS-records are available through DNS and (optionally) activate the key."
+	echo "--help         Display this help text."
+	echo "--activate     Activate the key if the DS is found."
+	echo "--force        Force activation of keys that are not available (implies --activate)."
+	echo "--quiet        Surpress non-critical output (loglevel = 1)."
+	echo "--verbose      More verbose output          (loglevel = 4)."
+	echo "-d|--debug     Detailed debug output        (loglevel = 9)."
+	echo "--all          Apply to all zones with outstanding DSes."
+	echo "--really-all   Apply to all zones, required or not."
+	echo "--test         Run unit tests."
+	exit -1
+}
+
+# stuur naar logfile en eventueel de console
+# $1 = loglevel
+log() {
+	loglevel="$1"
+	[ $loglevel -gt $LOGLEVEL ] && return
+	shift
+	echo "$*"
+	[ $loglevel -gt $LOGLEVEL ] && [ $loglevel -gt 3 ] && return # kritiek berichten altijd loggen
+	echo "$(date) $*" >> $logfile
+}
+
+
+# strip overbodige output
+nosql() {
+	egrep -v '^MySQL database' 
+}
+
+# strip leading and trailing whitespace
+trim() {
+	sed 's/^[[:space:]]*//; s/[[:space:]]*$//;'
+}
+
+# print stdin as a single line (removing linebreaks and stripping whitespace)
+row() {
+	tr '\n' ' ' | trim
+}
+
+# get OpenDNSSEC version
+ods_version() {
+	/usr/sbin/ods-enforcerd -V|awk '/^opendnssec version/ { print $3 }'
+}
+
+
+# use dig to get keytags of the DS'es published for a zone
+# $1 = zone to look up
+# $2 = outputfile '$dns' for all keytags
+get_keytags_from_dns() {
+	zone="$1"
+	dns="$2"
+	echo > $dns
+	# Figure out what the nameservers of the parent domain are
+	# so we can avoid using a resolver that might cache old information.
+	# There must be a better way. (? Use dig/drill in Trace mode and just look at the last entry???)
+	parent=${zone#*.}
+	answer=$($DIGP +short -t NS $parent)
+	ret=$?
+	server=$(echo "$answer" | sort -R | head -n 1)
+	if [ "$ret" != 0 ] || [ -z "$parent" ] || [ -z "$server" ]; then
+		log 2 "$zone: error: unable to determine authorative DNS-server. (parent domain='$parent', DNS-server='$server')"
+		return
+	fi
+
+	log 9 "Searching .$parent (NS: $server) for $zone"
+
+	# Keytags that can be retrieved from DNS
+	# dig: 39269 8 2 9EC50E7BBCC4095355A776D6183773197C05F320FDDE87E513022DB9 6A1E2F48
+	$DIG +adflag +aaonly  +short -t DS $zone @$server | cut -d ' ' -f 1 | trim | sort -u > $dns
+}
+
+# Get the keytags that ODS knows about.
+# $1 = zone to look up
+# $2 = outputfile '$ods' for all keytags
+# $3 = outputfile '$w4s' for waiting for ds-seen
+# $4 = outputfile '$w4g' for waiting for ds-gone
+get_keytags_from_ods() {
+	zone="$1"
+	ods="$2"
+	w4s="$3"
+	w4g="$4"
+
+	# check cache
+	if [ ! -s "$odscache" ] ; then
+		# ods-enforcer:tilt.nl;KSK;ready;waiting for ds-seen;2048;8;e59a9b5a16a393f969f4ec6d652db27d;LocalHSM;49087
+		$ENFORCER key list $ods_verbose --keytype KSK 2>&1 \
+			| grep -v '^key list completed' \
+			| sort 2>/dev/null > $keylist
+	fi
+ 
+	awk -F "$seperator" -v zone=$zone -v keytagcol=$keytagcol -v transcol=$transcol '$1 == zone                                       {print $keytagcol}' < $keylist | sort > $ods  # All keys known by ODS
+	awk -F "$seperator" -v zone=$zone -v keytagcol=$keytagcol -v transcol=$transcol '$1 == zone && $transcol == "waiting for ds-seen" {print $keytagcol}' < $keylist | sort > $w4s  # Keys in the state "waiting for DS-SEEN"
+	awk -F "$seperator" -v zone=$zone -v keytagcol=$keytagcol -v transcol=$transcol '$1 == zone && $transcol == "waiting for ds-gone" {print $keytagcol}' < $keylist | sort > $w4g  # Keys in the state "Waiting for DS-GONE"
+}
+
+# Compare the keytags from ODS to those found in DNS
+# $1 = inputfile '$dns'
+# $2 = inputfile '$ods'
+# $3 = inputfile '$w4s'
+# $4 = inputfile '$w4g'
+# $5 = outputfile '$seen'
+# $6 = outputfile '$notseen'
+# $7 = outputfile '$gone'
+# $8 = outputfile '$notgone'
+# $9 = outputfile '$unknown'
+compare_keytags() {
+	dns="$1"
+	ods="$2"
+	w4s="$3"
+	w4g="$4"
+	comm -12 $w4s $dns > $seen    # new in DNS
+	comm -23 $w4s $dns > $notseen # not yet in DNS
+	comm -23 $w4g $dns > $gone    # gone from DNS
+	comm -12 $w4g $dns > $notgone # still in DNS
+	comm -13 $ods $dns > $unknown # keys found in DNS that are unknown to DODS
+}
+
+# Notify ODS of keys to activate or deactivate
+# $1 = zone to operate on
+# $2 = inputfile '$seen' - keys that recently appeared in DNS
+# $3 = inputfile '$gone' - keys that are no longer in DNS
+notify_ods() {
+	zone="$1"
+	seen="$2"
+	gone="$3"
+	case $zone in "uvt.nl")
+		log 3 "$zone: De zone uvt.nl is speciaal, doe deze met de hand!"
+		return
+	esac
+
+	# activate newly published keys
+	for keytag in $(cat $seen); do
+		output=$($ENFORCER key ds-seen --zone $zone --keytag $keytag 2>&1 | nosql)
+		log 4 "$zone: $output"
+		log 4 "$zone: Key $keytag activated."
+	done
+
+	# deactive keys that have geen away
+	for keytag in $(cat $gone); do
+		output=$($ENFORCER key ds-gone --zone $zone --keytag $keytag 2>&1 | nosql)
+		log 4 "$zone: $output"
+		log 4 "$zone: Key $keytag deactivated."
+	done
+}
+
+print_debug() {
+	log 8 "In DNS: '$(cat $dns | row)'"
+	log 8 "In ODS: '$(cat $ods | row)'"
+	log 8 "Waiting for ds-seen: '$(cat $w4s | row)'"
+	log 8 "Waiting for ds-gone: '$(cat $w4g | row)'"
+	log 8 "Seen: '$(cat $seen | row)'"
+	log 8 "Not seen: '$(cat $notseen | row)'"
+	log 8 "Gone: '$(cat $gone | row)'"
+	log 8 "Not gone: '$(cat $notgone | row)'"
+	log 8 "Unknown: '$(cat $unknown | row)'"
+}
+
+digTEST() {
+	# dig +adflag +aaonly  +short -t DS uvt.nl @ns1.dns.nl
+cat<<EOF
+21035 8 2 FBA2A1128B51A10B7819E02083628FF3EB5EA070CFD0C2D28FCCD24C 8029D6C1
+EOF
+}
+
+digTEST2() {
+cat <<EOF
+33827 8 2 5B9FB9A893DAA05AC7B95C2265C2CD926A576E89A3E8498CD541EF4E 73D81E54
+30701 8 2 D53C38F3779438E59A5B8CE8744D6E34622BA2D9C4EADF1E270F8F36 EA667C9E
+49351 8 1 789265F323AF2F4869C9A14D728C0E99AA199382
+49351 8 2 65DD98874A16D4425ECC76C11B61DA52FA1F21CB2954E6ECC682D2A0 50CB20C6
+EOF
+}
+
+enforcerTEST() {
+cat <<EOF
+tilt.nl;KSK;retire;waiting for ds-gone;2048;8;78ee5d99516c9bc234993204568c0b80;LocalHSM;48134
+tilt.nl;KSK;retire;2018-04-27 07:16:35;2048;8;1ce5187e3349097ffaf6557ef67bbc87;LocalHSM;60559
+tilt.nl;KSK;ready;waiting for ds-seen;2048;8;e59a9b5a16a393f969f4ec6d652db27d;LocalHSM;49087
+key list completed in 0 seconds.
+EOF
+}
+
+digTEST3() {
+# dig +adflag +aaonly  +short -t DS mijnuvt.nl @ns1.dns.nl
+cat <<EOF
+54321 8 2 DS236656A65B454C664E432D131F343A546B65C56D53E12F124532EF 12345678
+21892 8 2 DA9882633A4BEC7287AFC2029B338CAAD742B8ED7D47654CA0D482EF E4665C63
+35389 8 2 D8A3E30DC79C06DC29DEE550934D21EBD6C485F6F376B79512661A17 54E65BE5
+EOF
+}
+
+enforcerTEST3() {
+# ods-enforcer key list -v -p  --zone mijnuvt.nl --keytype KSK
+cat <<EOF
+mijnuvt.nl;KSK;retire;waiting for ds-gone;2048;8;4f0fcf68d8468c2a30233fa945165fff;LocalHSM;35389
+mijnuvt.nl;KSK;ready;waiting for ds-seen;2048;8;f490c0e1ec0e351001fc4874d229c1af;LocalHSM;21892
+key list completed in 0 seconds.
+EOF
+}
+
+
+digTEST4() {
+# /usr/sbin/ods-enforcer key list -v -p --zone eurovalues.be --keytype KSK
+cat <<EOF
+27032 8 1 03D11D067EBC9F666A7A9E34D4A29CB1D12189F7
+27032 8 2 0805BF0D399876D132082F3936BDD6C2097F4AC8450626DFE9AA89DC A361046B
+60067 8 2 45DB8DE324FF326F7D95D226ACE1F74ADA4EA8D78961DA4215F30ADA 20C1E383
+60067 8 1 98CBA1327356A4C9C3FF676D4DC98BB11C067B31
+EOF
+}
+
+# return 10 = dig failed
+digTEST5() {
+cat <<EOF
+;; connection timed out; no servers could be reached
+EOF
+return 10
+}
+
+digPTEST6() {
+cat <<EOF
+ns1.dns.nl.
+ns2.dns.nl.
+ns5.dns.nl.
+ns3.dns.nl.
+sns-pb.isc.org.
+EOF
+}
+
+
+#accountingfinance.nl;KSK;retire;2018-04-30 17:20:20;2048;8;370d04521504b61a10cfd9f1e489b92e;LocalHSM;55559
+#accountingfinance.nl;KSK;ready;waiting for ds-seen;2048;8;c0cea25af6898fc0e6d4ed96e7042ae2;LocalHSM;26047
+
+testSupportedVersion() {
+	version=$(ods_version)
+	assertNotNull $version
+
+	majorversion=${version%%.*}
+	assertTrue "[ $majorversion -ge 1 ]"
+	assertTrue "[ $majorversion -le 2 ]"
+}
+
+testTrim() {
+	assertSame "aaa bbbb cccc" "$( echo ' aaa bbbb cccc ' | trim)"
+}
+
+
+# Zoek een domein met 1 keytag op in DNS
+testGet1KeytagFromDNS() {
+	# setup
+	digbak=$DIG
+	DIG=digTEST
+	dns=$(mktemp)
+	zone="uvt.nl"
+
+	get_keytags_from_dns $zone $dns
+	tags=$(cat $dns)
+	assertSame "21035" "$tags"
+
+	# cleanup
+	rm "$dns"
+	DIG=$digbak
+}
+
+# Zoek een domein met meerdere keytag op in DNS
+testGetKeytagsFromDNS() {
+	# setup
+	digbak=$DIG
+	DIG=digTEST2
+#	dns=$(mktemp)
+	zone="tilburguniversity.edu"
+
+	get_keytags_from_dns $zone $dns
+	tags=$(cat $dns)
+	assertSame "30701
+33827
+49351" "$tags"
+
+	# cleanup
+	rm $dns
+	DIG=$digbak
+}
+
+
+# Basisfunctionaliteit van get_keytags_from_ods testen
+testGetKeytagsFromODS() {
+	enforcerBAK=$ENFORCER
+	ENFORCER=enforcerTEST
+	zone="tilt.nl"
+
+	get_keytags_from_ods $zone $ods $w4s $w4g
+
+	assertSame "48134
+49087
+60559" "$(cat $ods)"
+	assertSame "49087" "$(cat $w4s)"
+	assertSame "48134" "$(cat $w4g)"
+
+	ENFORCER=$enforcerBAK
+}
+
+# In DNS: '35389 21892'
+# In ODS: '21892 35389'
+# Waiting for ds-seen: '21892'
+# Waiting for ds-gone: '35389'
+# Basisfunctionaliteit van compareketags testen
+testCompareKeytags() {
+	enforcerBAK=$ENFORCER
+	digBAK=$DIG
+	digpBAK=$DIGP
+
+	ENFORCER=enforcerTEST3
+	DIG=digTEST3
+	DIGP=digPTEST6
+	zone="mijnuvt.nl"
+
+	get_keytags_from_dns $zone $dns
+	get_keytags_from_ods $zone $ods $w4s $w4g
+	compare_keytags $dns $ods $w4s $w4g $seen $notseen $gone $notgone $unknown
+
+	print_debug
+
+	assertSame "21892" "$(cat $seen)"
+	assertSame "" "$(cat $notseen)"
+	assertSame "" "$(cat $gone)"
+	assertSame "35389" "$(cat $notgone)"
+	assertSame "54321" "$(cat $unknown)"
+
+	ENFORCER=$enforcerBAK
+	DIG=$digBAK
+	DIGP=$digpBAK
+
+}
+
+# Iedere keytag niet meer dan 1 keer behandelen.
+# Dubbele tags kunnen optreden wanneer verschillende DS'en
+# van dezelfde key worden gepubliceerd (met verschillende hash-algorimtes, bv SHA256 en SHA512).
+testGetDoubleKeytagsFromDNS() {
+	# setup
+	digbak=$DIG
+	DIG=digTEST4
+	zone="eurovalues.be"
+
+	get_keytags_from_dns $zone $dns
+	tags=$(cat $dns | row)
+	assertSame "27032 60067" "$tags"
+
+	# cleanup
+	DIG=$digbak
+
+}
+
+# Gaan we goed om met falende DNS-servers?
+testFailedDIG() {
+	# setup
+	digpbak=$DIG
+	DIGP=digTEST5
+	DIG=digTEST5
+	dns=$(mktemp)
+	zone="tilburguniversity.edu"
+
+	echo "Expect the following error message between the lines:"
+	echo "tilburguniversity.edu: error: unable to determine authorative DNS-server. (parent domain='edu', DNS-server=';; connection timed out; no servers could be reached')"
+
+	echo "--- start line ---------------"
+	get_keytags_from_dns $zone $dns
+	echo "--- stop line ----------------"
+	tags=$(cat $dns)
+	assertSame "" "$tags"
+
+	# cleanup
+	rm $dns
+	DIGP=$digpbak
+}
+
+
+# Hide differences between ODS versions
+# keytagcol   = The location of the column with the keytag in the output of ksm-util
+# seperator   = column seperator
+# ods_verbose = What options to use to get verbose output
+case $(ods_version) in
+	1.3*) ENFORCER=/usr/bin/ods-ksmutil;   keytagcol=9 ; transcol=4; seperator=' '; ods_verbose='-v' ;;
+	1.4*) ENFORCER=/usr/bin/ods-ksmutil;   keytagcol=12; transcol=4; seperator=' '; ods_verbose='-v' ;;
+	2*)   ENFORCER=/usr/sbin/ods-enforcer; keytagcol=9 ; transcol=4; seperator=';'; ods_verbose='-v -p' ;;
+	*) echo "Unknown OpenDNSSEC version, bailing out!"; exit 1 ;;
+esac
+
+
+# default options
+activate="no" # do not activate by default
+force="no"    # only activate keys that are really available
+LOGLEVEL="3"  # only print important messages
+zones=""
+
+
+
+# parse cli options
+until [ -z "$*" ];
+do
+	option="$1"
+	shift
+	case $option in
+		-h|--help)     usage ;;
+		--activate)    activate="yes" ;;
+		--force)       activate="yes" ; force="yes";;
+		--quiet)       LOGLEVEL=2 ;;
+		--verbose)     LOGLEVEL=4 ;;
+		-d|--debug)    LOGLEVEL=9 ;;
+		--all)         zones=$(echo " "; $ENFORCER key list 2>&1 | nosql | egrep -v 'Keys:|Zone:' | awk '/waiting for ds-/ {print $1}' | sort -u);;
+		--really-all)  zones=$(echo " "; $ENFORCER key list 2>&1 | nosql | egrep -v 'Keys:|Zone:' | awk '{print $1}' | sort -u);;
+		--test)        USE_SHUNIT=true ;;
+		--*)           usage ;;
+		*)             zones="$zones $option" ;;
+	esac
+done
+
+if [ -z "$zones" ] && ! $USE_SHUNIT; then
+	usage
+fi
+
+# create temporary files
+inittemp() {
+	dns=$(mktemp)      # keys found in DNS
+	ods=$(mktemp)      # keys known to OpenDNSSEC
+	w4s=$(mktemp)      # waiting for ds-sseen
+	w4g=$(mktemp)      # waiting for ds-gone
+	seen=$(mktemp)     # newly seen in DNS
+	notseen=$(mktemp)  # not yet in DNS
+	gone=$(mktemp)     # gone from DNS
+	notgone=$(mktemp)  # still in DNS
+	unknown=$(mktemp)  # keys found in DNS that are unknown to ODS
+	keylist=$(mktemp)  # raw keylist from ODS (cached for performance reasons)
+}
+
+cleantemp() {
+	rm $dns $ods $w4s $w4g $keylist $seen $notseen $gone $notgone $unknown
+}
+
+# unit testing
+if $USE_SHUNIT; then
+	inittemp
+	source /usr/bin/shunit2
+	cleantemp
+	exit 0
+fi
+
+for zone in $zones; do
+	inittemp
+	get_keytags_from_ods $zone $ods $w4s $w4g
+	get_keytags_from_dns $zone $dns
+
+	if [ ! -s "$dns" ]; then # $dns should never be empty
+		log 2 "$zone: warning: no key(s) found in DNS at all"
+		continue
+	fi
+
+	compare_keytags $dns $ods $w4s $w4g $seen $notseen $gone $notgone $unknown
+
+	print_debug
+
+	# activation
+	if [ "$activate" == "yes" ]; then
+		if [ "$force" == "yes" ]; then
+			cp $w4s $seen
+			log 3 "$zone: warning: forced activation of key(s) $seen"
+			cp $w4g $gone
+			log 3 "$zone: warning: forced removal of key(s) $gone"
+		fi
+		notify_ods $zone $seen $gone
+	fi
+
+	# logging
+	if [ -s "$notseen" ]; then
+		log 3 "$zone: The key(s) with tag(s) $(cat $notseen | row) are not yet present in DNS."
+	else
+		if [ ! -s "$w4s" ]; then
+			log 4 "$zone: No unactivated keys known by ODS, nothing to do."
+		else
+			log 4 "$zone: All new keys have been activated."
+		fi
+	fi
+
+	if [ -s "$notgone" ]; then
+		log 3 "$zone: The key(s) with tag(s) $(cat $notgone | row) are still present in DNS."
+	else
+		if [ ! -s "$w4g" ]; then
+			log 4 "$zone: No retired or dead keys known by ODS, nothing to do."
+		else
+			log 4 "$zone: All (known) retired and/or dead keys have been removed from DNS."
+		fi
+	fi
+	if [ -s "$unknown" ]; then
+		log 3 "$zone: Unknown key(s) with tag(s) $(cat $unknown | row) found in DNS."
+	fi
+done
+cleantemp

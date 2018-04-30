@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 
-# $Id: ods-deadkeys 69353 2014-09-02 16:06:19Z cgielen $
-# $URL: https://its-unix-vc.uvt.nl/its-unix/group/dns/opendnssec/usr/local/sbin/ods-deadkeys $
+# $Id: ods-deadkeys 90527 2017-11-02 13:47:12Z cgielen $
+# $URL: https://svn.uvt.nl/its-unix/systems/metagross/usr/local/sbin/ods-deadkeys $
 #
 # Make an overview of Key Siging Keys in DNS that are dead/unknown
 # and attempt to remove them.
 # After 2 weeks dead keys are purged from OpenDNSSEC.
+#
+# FIXME:
+#  - onderscheid tussen domeinen die automatisch worden beheerd (.nl) en de rest
 # 
 # Copyright 2013-2014 Casper Gielen
 # Written for Tilburg University
@@ -19,9 +22,16 @@ usage() {
 	echo "If no zones are specified all will be checked."
 	echo "--help         Display this help text."
 	echo "--quiet        Surpress output."
+	echo "--verbose      More output."
+	echo "--explain      Explain about keystates and what tot do."
 	echo "--remove       remove dead/unknown keys from upstream DNS (only .nl)."
 	echo "--all          Apply to all zones with retired KSKs."
 	echo "--really-all   Apply to all zones, required or not."
+	explainkeystates
+	exit -1
+}
+
+explainkeystates() {
 	echo ""
 	echo "Properly cleaned up :-)"
 	echo "Good. The key has been removed from DNS as it should be."
@@ -39,8 +49,6 @@ usage() {
 	echo "while uploading new keys."
 	echo "Remove the key from the parent DNS after veryfing that it is"
 	echo "not being used anymore."
-
-	exit -1
 }
 
 nosql() {
@@ -51,19 +59,26 @@ nounseen() {
 	egrep -v 'waiting for ds-seen' 
 }
 
-quiet="no"    # explain decisions
-verbose="no"  # also inform about properly cleaned files
-remove="no"   # remove dead/unknown keys from upstream DNS
+quiet=false   # explain decisions
+verbose=false # also inform about properly cleaned files
+remove=false  # remove dead/unknown keys from upstream DNS
+explain=false # explain the keystates
 zones=""
 
-# cut the name of the zones from the output of ods-ksmutil key export
+# DNSKEY states according to ODS
+BASIC_STATES="publish ready"
+EXTRA_STATES="active retire revoke dead"
+STATES="$BASIC_STATES $EXTRA_STATES"
+
+
+# cut the name of the zones from the output of ods-enforcer key export
 # example.com.  3600    IN      DNSKEY  257 3 8 AwEA...lRxyJTs= ;{id = 56330 (ksk), size = 2048b}
 cutzones()
 {
 	sed -n 's/\(.*\)\..*IN\t*DNSKEY\t*257.*/\1/gp'
 }
 
-# cut the keytags from the output of ods-ksmutil key export
+# cut the keytags from the output of ods-enforcer key export
 cuttags()
 {
 	sed -n 's/.*;{id = \(.*\) (ksk), size.*/\1/gp'
@@ -74,14 +89,14 @@ cuttags()
 listzones()
 {
 	echo " "	#FIXME
-	ods-ksmutil key list 2>&1 | nosql | awk '{print $1}' | sort -u
+	ods-enforcer zone list 2>&1 | nosql | awk '{print $1}' | sort -u
 }
 
 # all zones with dead keys
 listdeadzones()
 {
 	echo " "	#FIXME
-	ods-ksmutil key export --keystate dead 2>&1 | nosql | cutzones | sort -u
+	ods-enforcer key export --all --keystate dead 2>&1 | nosql | cutzones | sort -u
 }
 
 # all tags for a zone
@@ -90,9 +105,9 @@ listdeadzones()
 listtags()
 {
 	zone="$1"
-	states=${2:-"publish ready active retire dead"}
+	states=${2:-"$STATES"}
 	for state in $states; do
-		ods-ksmutil key export --keytype KSK --keystate $state --zone $zone 2>&1 
+		ods-enforcer key export --keytype KSK --keystate $state --zone $zone 2>&1 
 	done | nosql | cuttags | sort -u
 }
 
@@ -100,13 +115,14 @@ listtags()
 # cli options
 until [ -z "$*" ];
 do
-        option="$1"
-        shift
-        case $option in
-                -h|--help)     usage ;;
-                --quiet)       quiet="yes" ;;
-                --verbose)     verbose="yes" ;;
-		--remove)      remove="yes" ;;
+	option="$1"
+	shift
+	case $option in
+	-h|--help)     usage ;;
+	--quiet)       quiet=true ;;
+	--verbose)     verbose=true ;;
+	--explain)     explain=true ;;
+		--remove)      remove=true ;;
 		--all)         zones=$(listdeadzones);;
 		--really-all)  zones=$(listzones);;
                 *)             zones="$zones $option" ;;
@@ -124,7 +140,7 @@ fi
 # del empty lines
 zones=$(echo $zones | sed '/^$/d')
 
-worktodo=0
+worktodo=false
 
 for zone in $zones; do
 	# Keytags that can be retrieved from DNS
@@ -135,22 +151,23 @@ for zone in $zones; do
 	ods=$(listtags $zone)
 
 	# Just the tags of dead keys
-	# ods-ksmutil: mijnuvt.nl  KSK retire  2013-03-24 13:25:41    d3fe6d5bc1ea73bed16d449d42dcf5e7  LocalHSM  39269
+	# ods-enforcer: mijnuvt.nl  KSK retire  2013-03-24 13:25:41    d3fe6d5bc1ea73bed16d449d42dcf5e7  LocalHSM  39269
 	rip=$(listtags $zone dead)
 	
 	isclean=$(echo "$ods" | grep -v -x -F "$dns" | tr '\n' ' ' | sed 's/[ ]*$//g')
 	toclean=$(echo "$rip" | grep    -x -F "$dns" | tr '\n' ' ' | sed 's/[ ]*$//g')
 	unknown=$(echo "$dns" | grep -v -x -F "$ods" | tr '\n' ' ' | sed 's/[ ]*$//g')
 
-	if [ "$quiet" == "no" ]; then
-		if [ "$verbose" == "yes" ]; then
+	if $quiet; then
+		if $verbose; then
 		[ -n "$isclean" ] &&  printf "Properly cleaned up :-) %50s %s\n" $zone "$isclean"
 		fi
 		[ -n "$toclean" ] &&  printf "Dead keys in DNS    :-/ %50s %s\n" $zone "$toclean"
 		[ -n "$unknown" ] &&  printf "Unknown key in DNS  :-( %50s %s\n" $zone "$unknown"
 	fi
 	if [ -n "${toclean}${unknown}" ]; then
-		if [ "$remove" == "yes" ]; then
+		worktodo=true
+		if $remove; then
 			/usr/local/sbin/ods-uploadkeys $zone
 		else
 			printf "%-50s %s\n" "$zone" "$(echo $toclean $unknown| sort -u)"
@@ -159,5 +176,6 @@ for zone in $zones; do
 	fi
 done
 
-[ "$worktodo" == "1" ] && echo "Please remove these keys from DNS as soon as possible!"
+$worktodo && echo "Please remove these keys from DNS as soon as possible!"
+$worktodo && ($explain || $verbose) && explainkeystates
 exit 0
