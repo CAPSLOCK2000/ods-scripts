@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# $Id: ods-dswatcher 94813 2018-04-30 16:22:10Z cgielen $
+# $Id: ods-dswatcher 105408 2019-08-09 12:40:35Z cgielen $
 # $URL: https://svn.uvt.nl/its-unix/systems/metagross/usr/local/sbin/ods-dswatcher $
 #
 # Check if new DSes have been published in DNS and activate them, also deactives old DSes that have been removed.
@@ -12,16 +12,22 @@
 
 #
 # TODO
-# - use dig ods-enforcer in batch-mode instead of making seperate calls for each zone
 # - match on CKAID instead of keytag
-# - what to do about unknown keys? ignore? report?
+# - better deal with the difference between failure of DNS and a zone without DNSKEYS
+#   - support phase-in / phase-out of DNSKEYS
+#   - support zones without DNSKEYS
 
 #set -x
 
+# Default options for dig
+# This script runs often so don't worry about incidental failed queries or long timeouts.
+# Zones with temporary failures will be picked-up on the next run.
+dig_options="+timeout=2 +tries=2"
+
 # DIG: if not in path, specify full path to dig
-DIG="/usr/bin/dig"
+DIG="/usr/bin/dig $dig_options"
 # DIGP: DIG used for finding parent info
-DIGP="/usr/bin/dig"
+DIGP="/usr/bin/dig $dig_options"
 
 logfile=/var/log/dnssec/ods-dswatcher.log
 
@@ -62,7 +68,7 @@ nosql() {
 
 # strip leading and trailing whitespace
 trim() {
-	sed 's/^[[:space:]]*//; s/[[:space:]]*$//;'
+	sed 's/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d;'
 }
 
 # print stdin as a single line (removing linebreaks and stripping whitespace)
@@ -79,6 +85,7 @@ ods_version() {
 # use dig to get keytags of the DS'es published for a zone
 # $1 = zone to look up
 # $2 = outputfile '$dns' for all keytags
+# return code: exit code of last call to dig (0 = success)
 get_keytags_from_dns() {
 	zone="$1"
 	dns="$2"
@@ -86,20 +93,32 @@ get_keytags_from_dns() {
 	# Figure out what the nameservers of the parent domain are
 	# so we can avoid using a resolver that might cache old information.
 	# There must be a better way. (? Use dig/drill in Trace mode and just look at the last entry???)
+	# Perhaps check all masters?
 	parent=${zone#*.}
-	answer=$($DIGP +short -t NS $parent)
+	server=$($DIGP +short -t NS $parent| sort -R | head -n 1; exit ${PIPESTATUS[1]})
 	ret=$?
-	server=$(echo "$answer" | sort -R | head -n 1)
 	if [ "$ret" != 0 ] || [ -z "$parent" ] || [ -z "$server" ]; then
-		log 2 "$zone: error: unable to determine authorative DNS-server. (parent domain='$parent', DNS-server='$server')"
-		return
+		log 4 "$zone: error: unable to determine authorative DNS-server. (parent domain='$parent', DNS-server='$server')"
+		return $ret
 	fi
 
-	log 9 "Searching .$parent (NS: $server) for $zone"
+	log 8 "Searching .$parent (NS: $server) for $zone"
 
 	# Keytags that can be retrieved from DNS
 	# dig: 39269 8 2 9EC50E7BBCC4095355A776D6183773197C05F320FDDE87E513022DB9 6A1E2F48
-	$DIG +adflag +aaonly  +short -t DS $zone @$server | cut -d ' ' -f 1 | trim | sort -u > $dns
+	answer=$($DIG +adflag +aaonly  +short -t DS $zone @$server)
+	ret=$?
+	log 9 "dig raw: $answer"
+
+	if [ "$ret" != 0 ]; then
+		log 4 "$zone: error: DNS-server='$server': $answer)"
+		return $ret
+	fi
+
+	echo "$answer" | cut -d ' ' -f 1 | trim | sort -u > $dns
+
+	# return status of dig
+	return $ret
 }
 
 # Get the keytags that ODS knows about.
@@ -113,12 +132,12 @@ get_keytags_from_ods() {
 	w4s="$3"
 	w4g="$4"
 
-	# check cache
-	if [ ! -s "$odscache" ] ; then
+	# create cache of keys known to ODS
+	if [ ! -s "$keylist" ] ; then
 		# ods-enforcer:tilt.nl;KSK;ready;waiting for ds-seen;2048;8;e59a9b5a16a393f969f4ec6d652db27d;LocalHSM;49087
-		$ENFORCER key list $ods_verbose --keytype KSK 2>&1 \
-			| grep -v '^key list completed' \
+		$ENFORCER key list $ods_verbose --keytype KSK 2>/dev/null \
 			| sort 2>/dev/null > $keylist
+		#log 9 "ods keylist: $(cat $keylist)"
 	fi
  
 	awk -F "$seperator" -v zone=$zone -v keytagcol=$keytagcol -v transcol=$transcol '$1 == zone                                       {print $keytagcol}' < $keylist | sort > $ods  # All keys known by ODS
@@ -141,11 +160,11 @@ compare_keytags() {
 	ods="$2"
 	w4s="$3"
 	w4g="$4"
-	comm -12 $w4s $dns > $seen    # new in DNS
-	comm -23 $w4s $dns > $notseen # not yet in DNS
-	comm -23 $w4g $dns > $gone    # gone from DNS
-	comm -12 $w4g $dns > $notgone # still in DNS
-	comm -13 $ods $dns > $unknown # keys found in DNS that are unknown to DODS
+	comm -12 $w4s $dns | trim > $seen    # new in DNS
+	comm -23 $w4s $dns | trim > $notseen # not yet in DNS
+	comm -23 $w4g $dns | trim > $gone    # gone from DNS
+	comm -12 $w4g $dns | trim > $notgone # still in DNS
+	comm -13 $ods $dns | trim > $unknown # keys found in DNS that are unknown to DODS
 }
 
 # Notify ODS of keys to activate or deactivate
@@ -157,7 +176,8 @@ notify_ods() {
 	seen="$2"
 	gone="$3"
 	case $zone in "uvt.nl")
-		log 3 "$zone: De zone uvt.nl is speciaal, doe deze met de hand!"
+		log 2 "$zone: De zone $zone is speciaal, doe deze MET DE HAND!"
+		log 2 "bv: ods-enforcer key ds-seen --zone $zone --keytag ..."
 		return
 	esac
 
@@ -175,6 +195,29 @@ notify_ods() {
 		log 4 "$zone: Key $keytag deactivated."
 	done
 }
+
+# (De)activate keys by force. Do not check if it is ok to (de)activate, just do it.
+# $1 = zone to operate on
+# $2 = inputfile '$w4s' - waiting for seen
+# $3 = inputfile '$w4g' - waiting for gone
+# $4 = outputfile '$seen' - keys that can be activated
+# $5 = outputfile '$gone' - keys that can be deactivated
+force_activate() {
+	zone="$1"
+	w4s="$2"
+	w4g="$3"
+	seen="$4"
+	gone="$5"
+	if [ -s "$w4s" ]; then
+		cp $w4s $seen
+		log 3 "$zone: warning: forced activation of key(s) $(cat $seen)"
+	fi
+	if [ -s "$w4g" ]; then
+		cp $w4g $gone
+		log 3 "$zone: warning: forced removal of key(s) $(cat $gone)"
+	fi
+}
+
 
 print_debug() {
 	log 8 "In DNS: '$(cat $dns | row)'"
@@ -341,6 +384,8 @@ testCompareKeytags() {
 	enforcerBAK=$ENFORCER
 	digBAK=$DIG
 	digpBAK=$DIGP
+	keylistBAK=$keylist
+	keylist=$(mktemp)
 
 	ENFORCER=enforcerTEST3
 	DIG=digTEST3
@@ -353,6 +398,9 @@ testCompareKeytags() {
 
 	print_debug
 
+	assertSame "21892 35389 54321" "$(cat $dns | row)"
+	assertSame "21892 35389"  "$(cat $ods | row)"
+
 	assertSame "21892" "$(cat $seen)"
 	assertSame "" "$(cat $notseen)"
 	assertSame "" "$(cat $gone)"
@@ -362,6 +410,8 @@ testCompareKeytags() {
 	ENFORCER=$enforcerBAK
 	DIG=$digBAK
 	DIGP=$digpBAK
+	rm -f $keylist
+	keylist=$keylistBAK
 
 }
 
@@ -392,12 +442,11 @@ testFailedDIG() {
 	dns=$(mktemp)
 	zone="tilburguniversity.edu"
 
-	echo "Expect the following error message between the lines:"
-	echo "tilburguniversity.edu: error: unable to determine authorative DNS-server. (parent domain='edu', DNS-server=';; connection timed out; no servers could be reached')"
-
-	echo "--- start line ---------------"
+	log 4 "Expect the following error message between the lines:"
+	log 4 "tilburguniversity.edu: error: DNS-server=';; connection timed out; no servers could be reached': ;; connection timed out; no servers could be reached)"
+	log 4 "--- start line ---------------"
 	get_keytags_from_dns $zone $dns
-	echo "--- stop line ----------------"
+	log 4  "--- stop line ----------------"
 	tags=$(cat $dns)
 	assertSame "" "$tags"
 
@@ -406,6 +455,25 @@ testFailedDIG() {
 	DIGP=$digpbak
 }
 
+# Wordt bij een geforceerde (de)activate de juiste keys ge(de)activeert?
+# In DNS: '33827 35389'
+# In ODS: '21892 35389'
+# Waiting for ds-seen: '21892'
+# Waiting for ds-gone: '35389'
+testForceActivate() {
+	# setup
+	echo -e '33827\n35389' > $seen
+	echo '' > $gone
+	echo '21892' > $w4s
+	echo '35389' > $w4g
+	zone="mijnuvt.nl"
+
+	force_activate $zone $w4s $w4g $seen $gone > /dev/null
+
+	# cleanup
+	assertSame "$(cat $seen)" '21892'
+	assertSame "$(cat $gone)" '35389'
+}
 
 # Hide differences between ODS versions
 # keytagcol   = The location of the column with the keytag in the output of ksm-util
@@ -439,8 +507,8 @@ do
 		--quiet)       LOGLEVEL=2 ;;
 		--verbose)     LOGLEVEL=4 ;;
 		-d|--debug)    LOGLEVEL=9 ;;
-		--all)         zones=$(echo " "; $ENFORCER key list 2>&1 | nosql | egrep -v 'Keys:|Zone:' | awk '/waiting for ds-/ {print $1}' | sort -u);;
-		--really-all)  zones=$(echo " "; $ENFORCER key list 2>&1 | nosql | egrep -v 'Keys:|Zone:' | awk '{print $1}' | sort -u);;
+		--all)         zones=$(echo ' '; $ENFORCER key list 2>/dev/null | nosql | egrep -v 'Keys:|Zone:' | awk '/waiting for ds-/ {print $1}' | sort -u);; # start with a space so $zones is not empty
+		--really-all)  zones=$(echo ' '; $ENFORCER key list 2>/dev/null | nosql | egrep -v 'Keys:|Zone:' | awk '{print $1}' | sort -u);;
 		--test)        USE_SHUNIT=true ;;
 		--*)           usage ;;
 		*)             zones="$zones $option" ;;
@@ -453,6 +521,7 @@ fi
 
 # create temporary files
 inittemp() {
+	cleantemp
 	dns=$(mktemp)      # keys found in DNS
 	ods=$(mktemp)      # keys known to OpenDNSSEC
 	w4s=$(mktemp)      # waiting for ds-sseen
@@ -462,45 +531,43 @@ inittemp() {
 	gone=$(mktemp)     # gone from DNS
 	notgone=$(mktemp)  # still in DNS
 	unknown=$(mktemp)  # keys found in DNS that are unknown to ODS
-	keylist=$(mktemp)  # raw keylist from ODS (cached for performance reasons)
 }
 
 cleantemp() {
-	rm $dns $ods $w4s $w4g $keylist $seen $notseen $gone $notgone $unknown
+	rm -f $dns $ods $w4s $w4g $seen $notseen $gone $notgone $unknown
 }
 
-# unit testing
-if $USE_SHUNIT; then
-	inittemp
-	source /usr/bin/shunit2
-	cleantemp
-	exit 0
-fi
 
-for zone in $zones; do
-	inittemp
-	get_keytags_from_ods $zone $ods $w4s $w4g
-	get_keytags_from_dns $zone $dns
+# validate the input
+# - check return value of dig
+# - check for zones without any keys
+valid_input() {
+	dig_ret="$1"
+	dns="$2"
+
+	if [ $ret != 0 ] ; then
+		log 2 "DNS failed for $zone with code $ret. Skipping zone."
+		return 1
+	fi
 
 	if [ ! -s "$dns" ]; then # $dns should never be empty
-		log 2 "$zone: warning: no key(s) found in DNS at all"
-		continue
-	fi
-
-	compare_keytags $dns $ods $w4s $w4g $seen $notseen $gone $notgone $unknown
-
-	print_debug
-
-	# activation
-	if [ "$activate" == "yes" ]; then
-		if [ "$force" == "yes" ]; then
-			cp $w4s $seen
-			log 3 "$zone: warning: forced activation of key(s) $seen"
-			cp $w4g $gone
-			log 3 "$zone: warning: forced removal of key(s) $gone"
+		log 2 "$zone: warning: no key(s) found in DNS at all for zone $zone."
+		if [ "$force" == "no" ]; then # force activation of zones without (public) dnssec
+			log 2 "Skipping zone without DNSKEYs. Use --force to override."
+			return 1
+		else
+			log 2 "Proceeding without DNSKEYs because of --force."
+			return 0
 		fi
-		notify_ods $zone $seen $gone
 	fi
+	return 0
+}
+
+print_results() {
+	zone="$1"
+	notseen="$2"
+	notgone="$3"
+	unknown="$4"
 
 	# logging
 	if [ -s "$notseen" ]; then
@@ -523,7 +590,45 @@ for zone in $zones; do
 		fi
 	fi
 	if [ -s "$unknown" ]; then
-		log 3 "$zone: Unknown key(s) with tag(s) $(cat $unknown | row) found in DNS."
+		log 3 "$zone: Unknown key(s) with tag(s) '$(cat $unknown | row)' found in DNS."
 	fi
+}
+
+
+
+inittemp           # create temporary files
+keylist=$(mktemp)  # raw keylist from ODS (cached for performance reasons)
+                   # keylist should be cached and is therefor not created/cleaned with inittemp
+
+# unit testing
+if $USE_SHUNIT; then
+	inittemp
+	source /usr/bin/shunit2
+	cleantemp
+	exit 0
+fi
+
+for zone in $zones; do
+	inittemp
+	get_keytags_from_ods $zone $ods $w4s $w4g
+	get_keytags_from_dns $zone $dns
+	ret=$?
+
+	valid_input $ret $dns || continue
+
+	compare_keytags $dns $ods $w4s $w4g $seen $notseen $gone $notgone $unknown
+
+	print_debug
+
+	# activation
+	if [ "$activate" == "yes" ]; then
+		if [ "$force" == "yes" ]; then # force activation of zones without (public) dnssec
+			force_activate $zone $w4s $w4g $seen $gone
+		fi
+		notify_ods $zone $seen $gone # this is were all the action is
+	fi
+
+	# logging
+	print_results $zone $notseen $notgone $unknown
 done
 cleantemp
