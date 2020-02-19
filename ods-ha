@@ -1,5 +1,5 @@
 #!/bin/sh
-# $Id: ods-ha 90500 2017-11-01 16:19:17Z cgielen $
+# $Id: ods-ha 105675 2019-08-20 08:43:39Z cgielen $
 # $URL: https://svn.uvt.nl/its-unix/systems/metagross/usr/local/sbin/ods-ha $
 #
 # Copyright 2014 Casper Gielen
@@ -25,6 +25,9 @@ DISABLE_WRITE=0
 # the basedir that contains the data-directories
 DATADIR="/var/lib"
 
+# the location to store backups
+BACKUPDIR="/var/backups"
+
 # This file defines if this node is the master or the slave
 # It is not automatically created when missing to avoid mistakes.
 STATE=/var/lib/nsd/ods-ha.state
@@ -33,10 +36,12 @@ STATE=/var/lib/nsd/ods-ha.state
 SSH="/usr/bin/ssh -o ConnectTimeout=3"
 
 RSYNC="/usr/bin/rsync"
+TAR="/bin/tar"
 # copy
 if [ "$DISABLE_WRITE" -eq 1 ];
 then
 	RSYNC="echo $RSYNC"
+	TAR="echo $TAR"
 fi
 
 HOSTNAME=$(hostname)
@@ -60,10 +65,10 @@ stop() {
 
 status() {
 	echo "$HOSTNAME is in $(cat $STATE)-mode"
-	/usr/sbin/service nsd status && \
-	/usr/sbin/service mysql status && \
-	/usr/sbin/service opendnssec-enforcer status && \
-	/usr/sbin/service opendnssec-signer status
+	/bin/systemctl --no-pager --lines 0 status nsd                 | head -n 3 && \
+	/bin/systemctl --no-pager --lines 0 status mysql               | head -n 3 && \
+	/bin/systemctl --no-pager --lines 0 status opendnssec-enforcer | head -n 3 && \
+	/bin/systemctl --no-pager --lines 0 status opendnssec-signer   | head -n 3
 }
 
 # send all data (mysql, softhsm, opendnssec) from localhost to the destination with rsync
@@ -88,6 +93,38 @@ send() {
 	sleep 1
 	$SSH $destination start
 }
+
+# create a backup in a file that can be stored/transferred manually to another host
+backup() {
+	dumpfile="${BACKUPDIR}/ods-ha_$(date '+%Y-%m-%d').tar"
+	[ -s "$dumpfile" ] && die "Cowardly refusing to overwrite exsiting file ${dumpfile} ."
+	mkdir -p "${BACKUPDIR}"
+	echo "Creating a backup in ${dumpfile}."
+	stop
+	sleep 1
+	$TAR -C $DATADIR -cvpf ${dumpfile} mysql softhsm opendnssec
+	sleep 1
+	start
+}
+
+# restore a backup from file.
+# $1 = file to restore from
+restore() {
+	if [ -n "$1" ];
+	then
+		dumpfile="$1"
+	else
+		dumpfile=$(find $BACKUPDIR -iname "ods-ha_*.tar" |sort | tail -n 1)
+		[ ! -s "$dumpfile" ] && die "Unable to read ${dumpfile} ."
+	fi
+	echo "Restoring backup from ${dumpfile}."
+	stop
+	sleep 1
+	$TAR -C $DATADIR -xpvf "${dumpfile}"
+	sleep 1
+	start
+}
+
 
 # wrapper for send to be used by cronjobs
 # $1 = host to send data to
@@ -178,9 +215,12 @@ COMMAND :=  <failover>
 COMMAND :=  <send|send_cron> [target]
 COMMAND :=  <master|slave>
 COMMAND :=  <start|stop|status|receive>
+COMMAND :=  <backup|restore [file]>
 
 You should only need 'failover'.
 During a manual failover you will use 'send', 'master' and 'slave'.
+For backup or emergency purposes you can use backup and restore to
+dump the entire configuration to/from a tar-file.
 All other commands are for internal use.
 
 failover   copy all data and make this node the new master
@@ -192,6 +232,8 @@ start      start mysql, nsd and opendnssec
 stop       stop mysql, nsd and opendnssec
 status     show the current status of the system
 receive    accept an rsync-connection from the other host
+backup     dump all data to file (no passwords or configs)
+restore    restore data from a backup file
 
 Automatic failover
 ramachandra# ods-ha failover
@@ -204,6 +246,15 @@ ramachandra# ods-ha master             # required
 
 The optional steps ensure that all data is in sync and should be performed
 manually during a controlled failover.
+
+Backups
+This is a minimal backup procedure for exceptional
+situations such as upgrades and migrations. It is not
+very safe, do not rely on it.
+- Passwords are not included in this backup.
+  Backup/restore /etc/opendnssec/passwords.m4 manually!
+- Old data is not removed on restore.
+  Clean out /var/lib/{opendnssec,mysql,softhsm} manually!
 EOF
 }
 
@@ -230,9 +281,9 @@ else
 	COMMAND="$1"
 fi
 
-# second commandline argument specificies the copy destination
-[ -n "$2" ] && destination="$2"
-[ "$destination" = "$HOSTNAME" ] && die "Wrong host!"
+# second commandline argument specificies the copy target
+[ -n "$2" ] && target="$2"
+[ "$target" = "$HOSTNAME" ] && die "Wrong host!"
 
 if [ ! -e "$STATE" ]; then
 	echo "Unable to read state from $STATE, aborting." >&2
@@ -253,10 +304,12 @@ case "$COMMAND" in
 	slave)     slave ;;
 	is_master) is_master ;;
 	is_slave)  is_slave ;;
-	status)    if [ -z "$destination" ]; then status; else $SSH $destination status; fi ;;
+	status)    if [ -z "$target" ]; then status; else $SSH $target status; fi ;;
 	rsync*)    receive;;
-	send)      send $destination ;;
-	send_cron) send_cron $destination ;;
+	send)      send $target ;;
+	send_cron) send_cron $target ;;
+	backup)    backup ;;
+	restore)   if [ -z "$target" ]; then restore "$target"; fi ;;
 	*)         print_usage ; exit 1 ;;
 esac
 
